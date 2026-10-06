@@ -1,0 +1,276 @@
+---
+title: "Reporte 1: Hábitos de estudio y calificación final"
+author: "Saúl Ubaldo Rojas Vázquez"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  pdf_document:
+    number_sections: true
+    fig_caption: true
+fontsize: 11pt
+geometry: margin=2cm
+lang: es
+header-includes:
+  - \usepackage{float}
+  - \let\oldShaded\Shaded
+  - \let\endoldShaded\endShaded
+  - \renewenvironment{Shaded}{\footnotesize\oldShaded}{\endoldShaded}
+---
+
+```{r opciones, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      comment = "", fig.align = "center", fig.pos = "H")
+pkgs <- c("MASS", "tidyverse", "janitor", "knitr", "kableExtra", "caret")
+faltan <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(faltan)) install.packages(faltan, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+select <- dplyr::select
+
+tabla <- function(df, caption, ...) {
+  caption <- gsub("%", "\\\\%", caption)
+  kable(df, caption = caption, booktabs = TRUE, digits = 2, ...) |>
+    kable_styling(latex_options = c("hold_position", "scale_down"),
+                  font_size = 8)
+}
+pct <- function(x) paste0(round(100 * x, 1), "%")
+```
+
+```{r carga}
+ruta <- "../data/estudiantes/student_performance_dataset.csv"
+datos_raw <- read_csv(ruta, show_col_types = FALSE) |> clean_names()
+datos <- datos_raw |> select(-student_id) |> distinct()
+
+n_na  <- sum(is.na(datos_raw))
+n_dup <- nrow(datos_raw) - nrow(datos)
+vars_num <- c("study_time_hours", "attendance_percent",
+              "sleep_hours", "previous_grade")
+```
+
+# Introducción
+
+El conjunto *Student Performance and Study Habits* (Kaggle) describe a
+`r nrow(datos_raw)` estudiantes mediante sus hábitos (horas de estudio,
+asistencia y sueño), su contexto (género, educación de los padres, acceso a
+internet, trabajo de medio tiempo y actividades extracurriculares), su
+calificación previa y su calificación final. Es un conjunto **sintético**,
+por lo que las conclusiones describen la estructura de los datos y no son
+evidencia causal.
+
+El objetivo es de **alerta temprana**: anticipar la calificación final de
+un estudiante usando solo información disponible antes del examen final
+(sus hábitos y su calificación previa). Usamos Análisis Discriminante
+Lineal (LDA), que cumple un doble propósito: como clasificador, asigna a
+cada estudiante una calificación (A a F); como técnica descriptiva,
+identifica las combinaciones de variables que mejor separan las
+calificaciones. Buscamos responder: (1) ¿qué tan bien puede anticiparse la
+calificación final antes del examen?; (2) ¿qué características distinguen a
+los estudiantes de distintas calificaciones?; y (3) ¿entre qué
+calificaciones se equivoca el clasificador, es decir, qué tan grave es el
+error cuando ocurre?
+
+# Datos
+
+La base tiene `r ncol(datos_raw)` variables, `r n_na` valores faltantes y
+`r n_dup` registros duplicados (buscados ignorando `student_id`, que
+descartamos por ser solo un identificador).
+
+```{r descriptivas}
+datos |>
+  select(where(is.numeric)) |>
+  pivot_longer(everything(), names_to = "Variable") |>
+  group_by(Variable) |>
+  summarise(Mínimo = min(value), Q1 = quantile(value, 0.25),
+            Mediana = median(value), Media = mean(value),
+            `D.E.` = sd(value), Q3 = quantile(value, 0.75),
+            Máximo = max(value)) |>
+  tabla("Estadísticas descriptivas de las variables numéricas.")
+
+cat_txt <- datos |>
+  select(where(is.character), -final_grade) |>
+  imap_chr(\(x, nombre) {
+    p <- sort(prop.table(table(x)), decreasing = TRUE)
+    paste0("`", nombre, "` (",
+           paste0(names(p), " ", round(100 * p), "%", collapse = ", "), ")")
+  }) |>
+  paste(collapse = "; ")
+
+clases <- prop.table(table(datos$final_grade))
+clases_txt <- paste0(names(clases), " ", pct(clases), collapse = ", ")
+
+rangos <- datos |>
+  group_by(final_grade) |>
+  summarise(mn = min(final_exam_score), mx = max(final_exam_score))
+rangos_txt <- paste0(rangos$final_grade, ": ", rangos$mn, " a ", rangos$mx,
+                     collapse = "; ")
+```
+
+Las variables categóricas se distribuyen así: `r cat_txt`. La calificación
+final tiene la distribución `r clases_txt`.
+
+**Fuga de información.** `final_grade` es una discretización del examen
+final: sus rangos por categoría no se traslapan (`r rangos_txt`). Usar
+`final_exam_score` como predictor daría una clasificación trivialmente
+perfecta y, además, contradice el objetivo de alerta temprana, pues el
+examen aún no ocurre al momento de predecir. Por ello **la excluimos**.
+Conservamos `previous_grade`, que se observa antes del periodo evaluado.
+
+# Metodología
+
+LDA supone que, dentro de cada calificación $k$, el vector de predictores
+es normal multivariado con media $\mu_k$ y una **matriz de covarianzas
+común** $\Sigma$. Bajo ese supuesto, la regla de Bayes asigna cada
+estudiante a la clase con mayor función discriminante
+$$\delta_k(x) = x^\top \Sigma^{-1}\mu_k - \tfrac12 \mu_k^\top \Sigma^{-1}\mu_k + \log \pi_k,$$
+que es lineal en $x$. Elegimos LDA porque sus parámetros tienen
+interpretación directa y porque proyecta los datos en a lo más $K-1$
+direcciones que resumen la separación entre clases.
+
+**Decisiones.** (i) Usamos solo las cuatro variables numéricas, pues las
+categóricas son binarias o nominales y violan el supuesto de normalidad.
+(ii) Estandarizamos con la media y desviación del conjunto de
+**entrenamiento**, para que la información de prueba no influya en el
+ajuste; esto no cambia las clasificaciones de LDA, pero hace comparables
+los coeficientes. (iii) Estimamos $\pi_k$ con las proporciones observadas.
+(iv) Dividimos los datos en 70% entrenamiento y 30% prueba, estratificando
+por calificación, con semilla 2026.
+
+# Implementación
+
+**Partición y estandarización.**
+
+```{r particion, echo=TRUE}
+set.seed(2026)
+datos <- datos |> mutate(final_grade = factor(final_grade))
+idx <- createDataPartition(datos$final_grade, p = 0.7, list = FALSE)
+
+X_tr <- as.matrix(datos[idx, vars_num]);  y_tr <- datos$final_grade[idx]
+X_te <- as.matrix(datos[-idx, vars_num]); y_te <- datos$final_grade[-idx]
+
+medias <- colMeans(X_tr); desv <- apply(X_tr, 2, sd)
+X_tr <- scale(X_tr, center = medias, scale = desv)
+X_te <- scale(X_te, center = medias, scale = desv)
+```
+
+**Estimadores.** $\hat\pi_k = n_k/n$, $\hat\mu_k$ es la media de la clase
+$k$ y $\hat\Sigma = \frac{1}{n-K}\sum_k \sum_{i \in k}(x_i-\hat\mu_k)(x_i-\hat\mu_k)^\top$.
+
+```{r estimadores, echo=TRUE}
+K <- levels(y_tr)
+pi_hat <- prop.table(table(y_tr))
+mu_hat <- t(sapply(K, \(k) colMeans(X_tr[y_tr == k, ])))
+
+Sigma_hat <- Reduce(`+`, lapply(K, \(k) {
+  Xc <- scale(X_tr[y_tr == k, ], center = mu_hat[k, ], scale = FALSE)
+  crossprod(Xc)
+})) / (nrow(X_tr) - length(K))
+```
+
+```{r tabla-estimadores}
+cbind(`$\\hat\\pi_k$` = as.numeric(pi_hat), mu_hat) |>
+  as.data.frame() |>
+  tabla("Probabilidades a priori y medias por clase (variables estandarizadas).",
+        escape = FALSE)
+```
+
+**Funciones discriminantes y verificación.** Implementamos $\delta_k(x)$ y
+comparamos contra `MASS::lda()`.
+
+```{r discriminante, echo=TRUE}
+S_inv <- solve(Sigma_hat)
+delta <- function(X) sapply(K, \(k)
+  X %*% S_inv %*% mu_hat[k, ] -
+    0.5 * drop(t(mu_hat[k, ]) %*% S_inv %*% mu_hat[k, ]) + log(pi_hat[[k]]))
+
+pred_manual_te <- factor(K[max.col(delta(X_te))], levels = K)
+
+fit <- lda(X_tr, grouping = y_tr)
+pred_tr <- predict(fit, X_tr)$class
+pred_te <- predict(fit, X_te)$class
+coincidencia <- mean(pred_manual_te == pred_te)
+```
+
+La implementación manual coincide con `lda()` en `r pct(coincidencia)` de
+los estudiantes de prueba.
+
+```{r coeficientes}
+traza <- fit$svd^2 / sum(fit$svd^2)
+coefs <- as.data.frame(fit$scaling) |> rownames_to_column("Variable")
+top_ld1 <- coefs$Variable[which.max(abs(coefs$LD1))]
+
+tabla(coefs, paste0("Coeficientes de las funciones discriminantes. ",
+                    "Proporción de separación: ",
+                    paste0("LD", seq_along(traza), " = ", pct(traza),
+                           collapse = ", "), "."))
+```
+
+# Resultados
+
+```{r evaluacion, echo=TRUE}
+cm_tr <- confusionMatrix(pred_tr, y_tr)
+cm_te <- confusionMatrix(pred_te, y_te)
+```
+
+```{r tabla-confusion}
+tab <- cbind(as.data.frame.matrix(cm_tr$table),
+             as.data.frame.matrix(cm_te$table))
+tabla(tab, "Matrices de confusión (renglones: predicción; columnas: valor real).") |>
+  add_header_above(c(" " = 1, "Entrenamiento" = length(K), "Prueba" = length(K)))
+
+acc_tr <- cm_tr$overall[["Accuracy"]]
+acc_te <- cm_te$overall[["Accuracy"]]
+nir <- max(pi_hat)
+
+m <- cm_te$table
+errores <- m[row(m) != col(m)]
+ady <- sum(m[abs(row(m) - col(m)) == 1]) / sum(errores)
+
+sens <- if (is.matrix(cm_te$byClass)) cm_te$byClass[, "Sensitivity"] else cm_te$byClass[["Sensitivity"]]
+sens_txt <- paste0(K, " ", pct(sens), collapse = ", ")
+peor <- K[length(K)]
+sens_peor <- sens[length(sens)]
+```
+
+La exactitud es `r pct(acc_tr)` en entrenamiento y `r pct(acc_te)` en
+prueba, frente a `r pct(nir)` de un clasificador que siempre predijera la
+clase más frecuente. La sensibilidad por clase en prueba (proporción de
+estudiantes de cada calificación que el modelo identifica correctamente)
+es: `r sens_txt`. Del total de errores en prueba, `r pct(ady)` ocurren
+entre calificaciones adyacentes.
+
+# Conclusiones
+
+1. **Capacidad de anticipación.** Antes del examen final, LDA anticipa
+   correctamente la calificación de `r pct(acc_te)` de los estudiantes de
+   prueba, `r round(100 * (acc_te - nir), 1)` puntos porcentuales por
+   encima de la línea base. La diferencia entre entrenamiento y prueba
+   (`r round(100 * (acc_tr - acc_te), 1)` puntos)
+   `r if (abs(acc_tr - acc_te) < 0.05) "es pequeña, por lo que no hay evidencia de sobreajuste" else "sugiere cierto sobreajuste"`.
+   Para fines de alerta temprana, la clase más relevante es la calificación
+   más baja (`r peor`): el modelo detecta a `r pct(sens_peor)` de estos
+   estudiantes.
+2. **Características que distinguen las calificaciones.** La primera
+   función discriminante concentra `r pct(traza[1])` de la separación entre
+   clases y su coeficiente de mayor magnitud corresponde a `r top_ld1`.
+   Los cuatro coeficientes de LD1 tienen el mismo signo, y las medias por
+   clase de las cuatro variables decrecen de A a F; por lo tanto, LD1 es
+   esencialmente un eje de "desempeño general" en el que valores más
+   negativos corresponden a mejores calificaciones. Como las variables están
+   estandarizadas, los pesos son comparables: las horas de estudio pesan más
+   (`r round(coefs$LD1[coefs$Variable == "study_time_hours"], 2)`), seguidas
+   de la calificación previa
+   (`r round(coefs$LD1[coefs$Variable == "previous_grade"], 2)`), la
+   asistencia (`r round(coefs$LD1[coefs$Variable == "attendance_percent"], 2)`)
+   y las horas de sueño
+   (`r round(coefs$LD1[coefs$Variable == "sleep_hours"], 2)`). Es decir, los
+   hábitos en conjunto aportan más a la separación que la calificación
+   previa, aunque esta sigue siendo el segundo predictor individual. Como
+   las demás funciones discriminantes aportan muy poca separación, la
+   clasificación depende casi por completo de este único eje.
+3. **Gravedad de los errores.** `r if (ady > 0.5) "La mayoría de los errores ocurren entre calificaciones adyacentes (por ejemplo, B en lugar de C), lo que indica que LD1 ordena a los estudiantes de manera coherente con la escala de calificaciones y que, cuando el modelo se equivoca, el error suele ser moderado." else "Una proporción importante de los errores ocurre entre calificaciones no adyacentes, lo que indica que la separación lineal es limitada y que algunos errores son graves."`
+
+**Limitaciones.** Los datos son sintéticos; las variables categóricas
+quedan fuera del modelo; y el supuesto de covarianza común no se verificó
+formalmente.
+
+**Replicación.** R con `tidyverse`, `janitor`, `MASS`, `caret` y
+`kableExtra`; semilla 2026; partición estratificada 70/30 con
+`createDataPartition`; estandarización con parámetros de entrenamiento.

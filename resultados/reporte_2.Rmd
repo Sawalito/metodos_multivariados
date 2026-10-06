@@ -1,0 +1,290 @@
+---
+title: "Reporte 2: Perfiles metabólicos de pacientes mediante clustering jerárquico"
+author: "Saúl Ubaldo Rojas Vázquez"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  pdf_document:
+    number_sections: true
+    fig_caption: true
+fontsize: 11pt
+geometry: margin=2cm
+lang: es
+header-includes:
+  - \usepackage{float}
+  - \let\oldShaded\Shaded
+  - \let\endoldShaded\endShaded
+  - \renewenvironment{Shaded}{\footnotesize\oldShaded}{\endoldShaded}
+---
+
+```{r opciones, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      comment = "", fig.align = "center", fig.pos = "H")
+pkgs <- c("tidyverse", "janitor", "knitr", "kableExtra")
+faltan <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(faltan)) install.packages(faltan, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+select <- dplyr::select
+
+tabla <- function(df, caption, ...) {
+  caption <- gsub("%", "\\\\%", caption)
+  kable(df, caption = caption, booktabs = TRUE, digits = 2, ...) |>
+    kable_styling(latex_options = c("hold_position", "scale_down"),
+                  font_size = 8)
+}
+pct <- function(x) paste0(round(100 * x, 1), "%")
+```
+
+```{r carga}
+ruta <- "../data/diabetes/diabetes_risk_prediction_dataset.csv"   # AJUSTAR a tu ruta
+datos_raw <- read_csv(ruta, show_col_types = FALSE) |> clean_names()
+datos <- datos_raw |> select(-patient_id) |> distinct()
+n_dup <- nrow(datos_raw) - nrow(datos)
+
+na <- colSums(is.na(datos_raw)); na <- na[na > 0]
+na_txt <- if (length(na)) {
+  paste0("`", names(na), "` (", pct(na / nrow(datos_raw)), ")", collapse = ", ")
+} else "ninguna variable"
+
+vars_clu <- c("age", "bmi", "waist_circumference_cm", "blood_glucose",
+              "hb_a1c", "fasting_blood_sugar", "insulin_level",
+              "blood_pressure_systolic", "blood_pressure_diastolic",
+              "hdl", "ldl", "triglycerides")
+
+datos <- datos |>
+  mutate(across(where(is.numeric),
+                \(x) replace(x, is.na(x), median(x, na.rm = TRUE))),
+         diabetes_risk = fct_reorder(diabetes_risk, diabetes_risk_score))
+```
+
+# Introducción
+
+El conjunto *Diabetes Risk Prediction* (Kaggle) contiene `r nrow(datos_raw)`
+pacientes y `r ncol(datos_raw)` variables: antropometría, biomarcadores
+(glucosa, HbA1c, insulina, lípidos, presión arterial), estilo de vida,
+antecedentes clínicos y el puntaje y la categoría de riesgo de diabetes. Sin
+usar la etiqueta de riesgo, aplicamos clustering jerárquico para responder:
+(1) ¿existen perfiles metabólicos diferenciados y cuántos sugieren los
+datos?; (2) ¿qué biomarcadores los distinguen?; y (3) ¿coinciden con la
+categoría de riesgo?
+
+# Datos
+
+```{r descriptivas}
+riesgo <- prop.table(table(datos$diabetes_risk))
+riesgo_txt <- paste0(names(riesgo), " ", pct(riesgo), collapse = ", ")
+
+cor_mat <- cor(datos[, vars_clu])
+cor_med <- median(abs(cor_mat[upper.tri(cor_mat)]))
+cor_glu <- cor(datos$blood_glucose, datos$hb_a1c)
+```
+
+Hay `r n_dup` registros duplicados (buscados ignorando `patient_id`) y
+faltantes en `r na_txt`, que imputamos con la mediana. La categoría de
+riesgo se distribuye como `r riesgo_txt`. Las variables categóricas
+(género, hipertensión, antecedentes familiares, tabaquismo) tienen
+proporciones casi exactamente uniformes, la mediana de las correlaciones
+absolutas entre los 12 biomarcadores es `r round(cor_med, 3)` y la
+correlación entre glucosa y HbA1c, que en pacientes reales es alta, es
+`r round(cor_glu, 3)`. Todo ello indica que el conjunto es **sintético**,
+con variables generadas de forma independiente, lo que anticipa poca
+estructura de grupos.
+
+# Metodología
+
+El clustering jerárquico aglomerativo parte de cada paciente como un grupo
+y, en cada paso, fusiona los dos grupos más cercanos. El resultado es un
+**dendrograma**, cuya altura de fusión indica qué tan distintos eran los
+grupos al unirse. Usamos distancia euclidiana y comparamos cuatro
+**enlaces** (distancia entre grupos $A$ y $B$): **simple**,
+$\min_{a,b} d(a,b)$, que tiende a encadenar; **completo**,
+$\max_{a,b} d(a,b)$, que produce grupos compactos; **promedio**,
+$\frac{1}{|A||B|}\sum_{a,b} d(a,b)$; y **Ward**, que fusiona el par que
+menos aumenta $W = \sum_k \sum_{i\in C_k}\lVert x_i-\mu_k\rVert^2$. Tras
+fusionar $i$ y $j$, la distancia a cada grupo $k$ se actualiza con la
+fórmula de Lance–Williams,
+$d(k, i\cup j) = \alpha_i d_{ki} + \alpha_j d_{kj} + \beta d_{ij} + \gamma\lvert d_{ki}-d_{kj}\rvert$,
+cuyos coeficientes definen el enlace. El método no exige fijar el número de
+grupos: este se **sugiere** buscando un salto grande en las alturas de
+fusión, y si los distintos enlaces coinciden la estructura es más creíble.
+
+**Decisiones.** (i) Usamos los 12 biomarcadores numéricos (omitimos
+estatura, peso y colesterol total por redundantes, y las categóricas porque
+no admiten distancia euclidiana). (ii) El puntaje y la categoría de riesgo
+solo se usan para validar. (iii) Estandarizamos con media y desviación de
+entrenamiento. (iv) Como el método requiere la matriz completa de distancias
+($O(n^2)$ en memoria), construimos los dendrogramas con una muestra
+aleatoria de 2,000 pacientes (semilla 2026) y asignamos el resto (prueba) al
+centroide más cercano para evaluar si los grupos se generalizan.
+
+# Implementación
+
+```{r particion}
+set.seed(2026)
+idx <- sample(nrow(datos), 2000)
+X_tr <- as.matrix(datos[idx, vars_clu])
+X_te <- as.matrix(datos[-idx, vars_clu])
+
+medias <- colMeans(X_tr); desv <- apply(X_tr, 2, sd)
+X_tr <- scale(X_tr, center = medias, scale = desv)
+X_te <- scale(X_te, center = medias, scale = desv)
+D_tr <- dist(X_tr)
+```
+
+Implementamos el algoritmo aglomerativo con Lance–Williams; para Ward se
+trabaja con distancias al cuadrado, como `hclust(method = "ward.D2")`.
+
+```{r aglomerativo, echo=TRUE}
+aglomerativo <- function(d, enlace) {
+  D <- as.matrix(d); if (enlace == "ward") D <- D^2
+  diag(D) <- Inf
+  tam <- rep(1, nrow(D)); activo <- rep(TRUE, nrow(D)); alturas <- c()
+  for (paso in seq_len(nrow(D) - 1)) {
+    Dm <- D; Dm[!activo, ] <- Inf; Dm[, !activo] <- Inf
+    ij <- which(Dm == min(Dm), arr.ind = TRUE)[1, ]       # par más cercano
+    i <- ij[1]; j <- ij[2]; h <- D[i, j]
+    alturas <- c(alturas, if (enlace == "ward") sqrt(h) else h)
+    ni <- tam[i]; nj <- tam[j]; nk <- tam
+    nueva <- switch(enlace,                               # Lance–Williams
+      single   = pmin(D[i, ], D[j, ]),
+      complete = pmax(D[i, ], D[j, ]),
+      average  = (ni * D[i, ] + nj * D[j, ]) / (ni + nj),
+      ward     = ((ni + nk) * D[i, ] + (nj + nk) * D[j, ] - nk * h) /
+                 (ni + nj + nk))
+    D[i, ] <- nueva; D[, i] <- nueva; D[i, i] <- Inf
+    activo[j] <- FALSE; tam[i] <- ni + nj
+  }
+  alturas
+}
+```
+
+```{r verificacion}
+enlaces <- c(single = "single", complete = "complete",
+             average = "average", ward = "ward.D2")
+m <- sample(nrow(X_tr), 200); d_m <- dist(X_tr[m, ])
+verif <- imap_lgl(enlaces, \(metodo_hclust, enlace) isTRUE(all.equal(
+  sort(aglomerativo(d_m, enlace)), sort(hclust(d_m, metodo_hclust)$height))))
+hcs <- map(enlaces, \(metodo) hclust(D_tr, method = metodo))
+```
+
+En una submuestra de 200 pacientes, las alturas de fusión de nuestra
+implementación coinciden con las de `hclust()` en
+`r sum(verif)` de los 4 enlaces. Por eficiencia, los dendrogramas con los
+2,000 pacientes se calculan con `hclust()`.
+
+```{r dendrogramas, fig.cap="Dendrogramas de los 2,000 pacientes de entrenamiento según el tipo de enlace.", fig.height=3, out.width="90%"}
+par(mfrow = c(1, 4), mar = c(1, 4, 2, 0.5), cex = 0.6)
+iwalk(hcs, \(h, nombre) plot(h, labels = FALSE, hang = -1, main = nombre,
+                             xlab = "", sub = "", ylab = "Altura"))
+```
+
+```{r alturas}
+alt <- t(sapply(hcs, \(h) rev(h$height)[1:7]))
+colnames(alt) <- paste0("k = ", 2:8)
+tabla(as.data.frame(alt),
+      "Altura de la fusión que reduce el número de grupos de k a k - 1.")
+
+k <- 3   # mayor salto de altura en el dendrograma de Ward (de 3 a 2 grupos)
+tam <- t(sapply(hcs, \(h) sort(table(cutree(h, k)), decreasing = TRUE)))
+tam_txt <- function(e) paste(tam[e, ], collapse = "/")
+```
+
+**Elección del número de grupos.** Un salto grande entre las alturas de
+$k+1$ y $k$ grupos indica que hubo que unir grupos muy distintos, por lo
+que conviene cortar antes. En los enlaces simple, completo y promedio las
+alturas descienden de forma casi continua, sin un salto que destaque. En
+Ward, el mayor salto ocurre de 3 a 2 grupos (de 32.83 a 38.70), mientras
+que de 4 a 3 la altura apenas cambia (32.12 a 32.83); por ello elegimos
+$k = `r k`$, aunque incluso este salto es modesto. Al cortar en $k = `r k`$,
+los tamaños de grupo son `r tam_txt("single")` (simple),
+`r tam_txt("average")` (promedio), `r tam_txt("complete")` (completo) y
+`r tam_txt("ward")` (Ward): simple y promedio solo aíslan unos cuantos
+pacientes, efecto del encadenamiento. Adoptamos **Ward** para la partición
+final porque produce grupos compactos de tamaño comparable y su criterio es
+coherente con describir cada grupo por su centroide.
+
+# Resultados
+
+Reetiquetamos los grupos de Ward en orden creciente de HbA1c y asignamos
+cada paciente de prueba al centroide más cercano.
+
+```{r particion-final}
+g_tr <- cutree(hcs$ward, k)
+centros <- t(sapply(seq_len(k), \(j) colMeans(X_tr[g_tr == j, , drop = FALSE])))
+ord <- order(centros[, "hb_a1c"])
+centros <- centros[ord, , drop = FALSE]; g_tr <- match(g_tr, ord)
+
+dist2 <- function(X, C) outer(rowSums(X^2), rowSums(C^2), "+") - 2 * X %*% t(C)
+g_te <- max.col(-dist2(X_te, centros), ties.method = "first")
+
+W_pac <- function(X, g) sum((X - centros[g, ])^2) / nrow(X)
+```
+
+```{r perfil}
+centros_orig <- sweep(sweep(centros, 2, desv, "*"), 2, medias, "+")
+
+extra <- datos[idx, ] |>
+  mutate(grupo = g_tr) |>
+  group_by(grupo) |>
+  summarise(`n (entrenamiento)` = n(),
+            `% hipertensión` = 100 * mean(hypertension == "Yes"),
+            `% antecedentes familiares` = 100 * mean(family_history_diabetes == "Yes"),
+            `Puntaje de riesgo medio` = mean(diabetes_risk_score)) |>
+  select(-grupo)
+
+perfil <- rbind(t(centros_orig), t(as.matrix(extra)))
+colnames(perfil) <- paste("Grupo", seq_len(k))
+tabla(as.data.frame(perfil),
+      "Centroides en unidades originales y perfil de los grupos (entrenamiento).")
+
+riesgo_grupo <- extra$`Puntaje de riesgo medio`
+```
+
+```{r validacion}
+t_tr <- table(Grupo = g_tr, Riesgo = datos$diabetes_risk[idx])
+t_te <- table(Grupo = g_te, Riesgo = datos$diabetes_risk[-idx])
+
+niv <- levels(datos$diabetes_risk)
+p_tr <- prop.table(t_tr, 1); p_te <- prop.table(t_te, 1)
+tab <- cbind(as.data.frame.matrix(round(100 * p_tr, 1)),
+             as.data.frame.matrix(round(100 * p_te, 1)))
+rownames(tab) <- paste("Grupo", rownames(tab))
+tabla(tab, "Distribución (%) de la categoría de riesgo dentro de cada grupo.") |>
+  add_header_above(c(" " = 1, "Entrenamiento" = length(niv), "Prueba" = length(niv)))
+
+alto_te <- p_te[, ncol(p_te)]
+```
+
+# Conclusiones
+
+1. **Estructura de grupos.** Los dendrogramas sugieren `r k` grupos, pero
+   la evidencia es débil: solo Ward muestra un salto apreciable, los demás
+   enlaces no lo reproducen y la suma de cuadrados dentro de los grupos por
+   paciente (`r round(W_pac(X_tr, g_tr), 2)`) es apenas menor que la
+   varianza total de las 12 variables estandarizadas (12): los grupos
+   explican cerca de `r pct(1 - W_pac(X_tr, g_tr) / 12)` de la
+   variabilidad. Son particiones del espacio de biomarcadores más que
+   poblaciones naturales, lo cual es consistente con datos sintéticos.
+2. **Biomarcadores que los distinguen.** No la glucosa ni la HbA1c (sus
+   centroides difieren menos de 0.4 desviaciones estándar), sino insulina,
+   triglicéridos, glucosa en ayunas, LDL y presión arterial. El grupo 1
+   combina triglicéridos y presión altos con insulina baja; el grupo 2,
+   glucosa en ayunas y LDL altos con insulina y triglicéridos bajos; el
+   grupo 3, el más numeroso, insulina alta y presión sistólica más baja.
+   Hipertensión y antecedentes familiares rondan 50% en los tres.
+3. **Relación con el riesgo.** El puntaje medio por grupo es
+   `r paste(round(riesgo_grupo, 1), collapse = ", ")` y, en prueba, la
+   proporción en la categoría de mayor riesgo va de `r pct(min(alto_te))`
+   a `r pct(max(alto_te))`. El grupo 2 la concentra más, posiblemente por su
+   glucosa en ayunas elevada, pero el riesgo alto es mayoritario en los tres
+   grupos: los perfiles se asocian con el riesgo sin reproducirlo.
+4. **Generalización.** La suma de cuadrados por paciente es similar en
+   entrenamiento y prueba (`r round(W_pac(X_tr, g_tr), 2)` frente a
+   `r round(W_pac(X_te, g_te), 2)`), pero las proporciones por grupo cambian
+   (el grupo 3 pasa de `r pct(mean(g_tr == 3))` a `r pct(mean(g_te == 3))`
+   y el grupo 2 de `r pct(mean(g_tr == 2))` a `r pct(mean(g_te == 2))`):
+   la asignación al centroide más cercano no reproduce las fronteras de
+   Ward, otra señal de límites poco definidos.
+
+**Limitaciones y replicación.** Datos sintéticos; dendrogramas con una
+submuestra; variables categóricas excluidas; elección subjetiva de $k$. R
+con `tidyverse`, `janitor` y `kableExtra`, semilla 2026.

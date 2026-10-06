@@ -1,0 +1,12 @@
+# RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Artefactos de knitr/rmarkdown
+*_cache/
+*_files/
+*.log
+*.aux
+*.tex
